@@ -1,0 +1,298 @@
+Cartoonify Studio Code Walkthrough
+=================================
+
+Overview
+--------
+Cartoonify Studio consists of two Python modules:
+1. `Image_Effects.py` supplies the image-processing algorithms used to stylize pictures.
+2. `gui_app.py` builds a Material Design-inspired Tkinter interface, wires user actions to
+   the processing functions, and manages live previews, batch jobs, and webcam capture.
+The following sections explain every construct in both files in the order they appear.
+
+Image_Effects.py
+----------------
+Module Header
+- Imports standard logging and math utilities, plus OpenCV (`cv2`) and NumPy.
+- Declares module-level caches for structuring elements and halftone distance maps to
+  avoid recalculating expensive matrices across calls.
+
+Helper Functions
+- `ensure_odd(v)`: Casts to integer and forces the result to be odd. Many OpenCV filters
+  (bilateral, median) require odd kernel sizes; the helper guarantees compliance.
+- `_validate_rgb_image(img_rgb)`: Confirms the input is an 8-bit three-channel NumPy array.
+  It raises descriptive errors when a wrong type or shape is provided, and clips as well as
+  casts to `uint8` if needed. Every public effect begins by passing the user image through
+  this guard.
+- `_resolve_bilateral_params(shape, base_kernel)`: Scales the bilateral filter diameter and
+  sigmas according to the longest dimension of the image. This adaptive sizing keeps blur
+  strength visually consistent between small and large inputs.
+- `_get_structuring_element(size)`: Retrieves or builds a rectangular morphological kernel
+  of the requested size, caching the NumPy array for reuse. Sizes of 1 or less return `None`.
+- `_adaptive_canny(gray_blur, base_low, base_high, mix)`: Derives automatic low/high Canny
+  thresholds from the median pixel value, blends them with user-provided bases using the
+  `mix` ratio, and enforces `low < high`. This yields responsive edge detection that adapts
+  to exposure changes while still respecting manual guidance.
+- `_apply_gamma(image, gamma)`: Precomputes a 256-value lookup table to apply gamma
+  correction efficiently. Gamma below 1 brightens shadows; gamma above 1 darkens them.
+- `_apply_local_contrast(image, strength)`: Uses CLAHE (adaptive histogram equalization)
+  on the L channel in LAB space to add texture detail when `strength > 0`.
+- `_prepare_halftone_distances(step)`: Precomputes, caches, and returns a Cartesian distance
+  grid of size `step x step`, centered for use in the halftone dot mask.
+- `_watercolor_fallback(img_rgb)`: Provides a safe bilateral + median blur pipeline used
+  whenever OpenCV's `cv2.stylization` is unavailable. Ensures the watercolor effect always
+  returns an image.
+
+ImageEffects Class
+- Acts as a namespace exposing several static styling methods. Each public method starts by
+  validating the image.
+
+`cartoon_effect(...)`
+1. Copies the image, converts to grayscale, and applies an adaptive bilateral filter tuned by
+   `_resolve_bilateral_params` to smooth grey levels without erasing edges.
+2. Generates binary edges via adaptive thresholding and optionally dilates them `edge_enhance`
+   times for thicker outlines.
+3. Runs bilateral filtering on the color image, then performs k-means color quantization to
+   reduce the palette to `color_levels`. A fallback quantization avoids crashes on failures.
+4. Combines quantized colors with the binary edge mask, applies global contrast scaling, and
+   optionally boosts saturation/value in HSV space.
+5. Applies gamma remapping and optional local contrast enhancement.
+6. If a face mask is supplied, softly blends the cartoon result with the original image to
+   maintain recognizable features.
+7. Returns the stylized RGB array.
+
+`cartoon_effect_v2(...)`
+1. Converts to grayscale, applies Gaussian blur, and computes Canny edges using adaptive
+   thresholds blended with manual inputs (`adaptive_canny_mix`).
+2. Inverts edges, optionally thickens them with morphological closing based on
+   `line_thickness`.
+3. Smooths colors using an adaptive bilateral filter and optional median blur to remove speckle.
+4. Masks the smoothed colors with the refined edges to keep shading inside outlines.
+5. Applies contrast, optional saturation/value adjustments, gamma correction, local contrast,
+   and unsharp masking (`sharpen_amount`).
+6. Performs the same optional face-mask blend as the primary cartoon effect.
+
+`pencil_sketch(...)`
+- Inverts the grayscale image, blurs it, and divides the original grayscale by the inverted
+  blur to create a pencil-stroke effect. The single-channel result is converted back to RGB
+  for uniform handling.
+
+`watercolor(...)`
+- Attempts to call `cv2.stylization` with the provided sigma parameters. If OpenCV raises an
+  error (e.g., when the feature is missing from the build), it logs a warning and returns the
+  `_watercolor_fallback` result. A broad `Exception` handler safeguards against unexpected
+  failures, ensuring a valid output every time.
+
+`comic_dots(...)`
+1. Downsamples the image and bilaterally filters the small version for smooth shading, then
+   upsamples back to the original size.
+2. Converts the original to grayscale, pads it so its dimensions are exact multiples of the
+   `dot_scale` step, and computes sample intensities on the coarse grid.
+3. Uses `_prepare_halftone_distances` to build concentric dot masks whose radii depend on the
+   sampled brightness. Darker regions get larger dots.
+4. Generates a tiled dot mask, bitwise combines the softened color image with inverted dots, and
+   overlays Canny edges to emulate a comic-book halftone finish.
+
+GUI_App.py
+----------
+Module Header and Imports
+- Brings in OS utilities, threading, Tkinter, concurrent futures, OpenCV, NumPy, Pillow, and
+  logging. Sets a global logging level of INFO.
+- Tries to import `tkinterdnd2` for drag-and-drop support, toggling the `DND_AVAILABLE` flag.
+- Imports `ImageEffects` and `ensure_odd` from the companion module.
+
+Material3Theme Class
+- Encapsulates all color tokens, typography scales, and elevation presets used across the UI.
+  Colors implement a lavender-focused palette matching the user's request. Typography tuples
+  define fonts and sizes for headings, labels, and body text. Elevation maps to Tkinter relief
+  and border widths.
+
+Global Constants and Helper Functions
+- `THUMBNAIL_PREVIEW_SIZE` and `LIVE_PREVIEW_CROP` control preview dimensions.
+- `pil_from_cv_rgb` and `cv_rgb_from_pil` convert between Pillow images and NumPy arrays.
+- `safe_int` / `safe_float` convert user inputs while providing defaults when parsing fails.
+- Color utility trio (`_hex_to_rgb`, `_rgb_to_hex`, `_blend_colors`) and `_darken_color` support
+  dynamic theming and animated transitions.
+
+_ToolTip Class
+- Implements delayed tooltip popups bound to a widget. Schedules a `.after` callback on hover,
+  displays a borderless toplevel with styled text, and cleans up when the pointer leaves or the
+  widget loses focus.
+
+CartoonifyStudio Class
+Initialization
+- Optionally replaces the root with a drag-and-drop enabled `TkinterDnD.Tk` when available.
+- Sets window geometry based on screen size, applies theme colors, and registers a custom
+  close handler.
+- Initializes state variables for loaded images, undo tracking, a webcam stop flag, and live
+  preview scheduling.
+- Stores default slider values in a dictionary so they can be reapplied during resets.
+- Preloads spinner animation frames if `spinner.gif` exists.
+- Establishes numerous animation-related fields (button glow, scroll hint, entrance sequence),
+  manages progress bar state, creates a single-thread preview executor, and tracks tooltips.
+- Calls setup helpers to configure ttk styles, build the interface layout, start animations, and
+  bind global shortcuts.
+- Attempts to load a Haar cascade for optional face detection; falls back gracefully when
+  unavailable.
+
+Window Closing (`_on_close`)
+- Signals the webcam loop to stop, cancels pending live preview callbacks, stops progress bar
+  animations, shuts down active ttk progress indicators, terminates the preview executor, and
+  then quits/destroys the Tk root. Guards each interaction against `tk.TclError` to handle
+  shutdown races cleanly.
+
+Spinner Loading (`_load_spinner`)
+- Reads `spinner.gif` from the script directory, converting each frame into a `PhotoImage` so the
+  progress UI can display animated feedback when available.
+
+Tooltip Attachment (`_attach_tooltip`)
+- Associates tooltips with any widget requiring inline documentation.
+
+Style Configuration (`_setup_material3_styles`)
+- Defines ttk style rules for Material 3-inspired buttons, labels, frames, progress bars, combo-
+  boxes, sliders, and checkbuttons. Uses the theme color dictionary for backgrounds, hover states,
+  and focus behavior. Clones baseline progress bar layouts to create custom thickness and color
+  variants.
+
+Animated Buttons (`_register_animated_button`, `_start_button_animation_loop`, `_animate_button_styles`)
+- Registers ttk buttons for glow animations, storing base/accent colors, hover states, and phase
+  offsets. The animation loop periodically interpolates colors to produce a soft breathing effect,
+  while hover interactions tweak the intensity. Additional handlers add tactile feedback on press.
+
+Scroll Hint Animation (`_start_scroll_hint_animation`, `_animate_scroll_hint`)
+- Pulses the color of the navigation scroll hint label to remind users that the side panel is
+  scrollable.
+
+Live Preview Progress (`_start_preview_progress`, `_stop_preview_progress`)
+- Controls an indeterminate progress bar and status label shown while the live preview worker is
+  running.
+
+Entrance Animation (`_start_entrance_animations`, `_animate_entrance`, `_register_entrance_animation`)
+- Provides a fade-in ramp for widgets so the UI appears smoothly when the app launches.
+
+Scrollable Navigation Helpers (`_on_frame_configure`, `_on_mousewheel`)
+- Maintain the canvas scroll region and translate mouse wheel events into vertical scrolling,
+  accommodating Windows, macOS, and Linux event variations.
+
+Layout Builders
+- `_create_material3_header`: Renders the app title and tagline at the top.
+- `_create_material3_layout`: Organizes the window into a left navigation rail (input and
+  parameter controls) and right-hand preview area, inserted inside the themed frames. Registers
+  drag-and-drop when supported and wires slider events to trigger live updates.
+- `_create_navigation_rail`: Constructs a scrollable side panel by nesting a frame inside a canvas,
+  attaching a vertical scrollbar and binding mouse wheel events. Populates the rail with four
+  sections: Input controls, style selector, parameter sliders, and action buttons. Appends a
+  scrolling hint label.
+- `_create_input_section_m3`: Provides buttons for browsing files, batch processing, and starting
+  webcam mode. Each button receives a glow animation style.
+- `_create_style_section_m3`: Supplies a combobox to pick among the five available styles and a
+  toggled option to emphasize faces during processing.
+- `_create_parameters_section_m3`: Builds two frames of sliders—standard cartoon tunables and
+  advanced V2 parameters. Also creates the live-preview toggle, status text, and indeterminate
+  progress bar. Invokes `_update_parameter_widgets` to show the proper slider group for the current
+  style.
+- `_create_actions_section_m3`: Adds buttons for processing, saving, exporting comparisons,
+  resetting, and undoing the last result. Button states are managed to reflect availability.
+- `_create_main_content`: Assembles the preview panel with labels indicating original vs processed
+  images and placeholder text encouraging the user to drop or browse for an image.
+- `_create_bottom_app_bar`: Holds the shared status label and a progress bar that appears on demand
+  during long-running operations.
+- `_create_material3_slider`: Standardizes slider creation by pairing each ttk scale with a label,
+  value readout, and optional tooltip. The command callback updates the value label live.
+
+Event and Command Wiring
+- `_bind_shortcuts`: Registers Ctrl+O (open), Ctrl+W (webcam), Ctrl+S (save), spacebar (process),
+  and Escape (stop webcam) as global accelerators.
+
+File and Batch Operations
+- `upload`: Opens a file dialog, loads the selected image via `_load_image`.
+- `batch_select`: Asks for multiple files and an output folder, then spawns `_run_batch` on a
+  background thread.
+- `_run_batch`: Iterates through all selected files, updates the status bar with determinate
+  progress, processes each image via `_process_image`, writes PNG outputs, and notifies the user
+  when complete.
+- `_on_drop`: Handles drag-and-drop events by loading the first dropped file.
+- `_load_image`: Reads the image using OpenCV, stores original/cached copies, resets UI state,
+  updates the “before” preview, disables post-processing buttons until the user runs the effect,
+  and schedules a live preview update.
+- `_update_before_preview`, `_update_after_preview`, `_update_preview`: Convert NumPy arrays to
+  thumbnails and display them on the Tk labels, handling errors gracefully.
+
+Status and Progress Management
+- `_set_status`: Centralizes status-bar updates. It toggles the shared progress bar between
+  determinate and indeterminate modes, starts smooth animations via `_animate_progress`, and hides
+  the bar when idle.
+- `_animate_progress`: Eases a determinate progress bar toward the requested target to avoid harsh
+  jumps.
+
+Live Preview Engine
+- `_on_control_change`: Debounces control adjustments and triggers live preview updates; when the
+  style changes it first switches visible parameter groups.
+- `_schedule_live_preview`: Cancels any pending job, resets the cancellation token, starts the
+  preview progress indicator, and queues `_run_live_preview` after a short delay to coalesce rapid
+  slider changes.
+- `_toggle_live_preview`: Enables or disables live preview. Disabling reverts to the last processed
+  full image and clears the progress indicator.
+- `_run_live_preview`: Runs inside the thread pool, cropping the center of the original image for
+  speed, optionally generating a face mask, and invoking `_process_image`. Completion or failure is
+  marshalled back to the GUI thread.
+- `_complete_live_preview` and `_handle_preview_error`: Update the processed preview pane, stop the
+  spinner, and adjust the status message when the worker finishes or encounters an error.
+
+Parameter Group Switching
+- `_update_parameter_widgets`: Shows either the standard or advanced slider frame depending on the
+  selected style and hides tone controls when irrelevant.
+
+Face Detection Helper
+- `_get_face_mask`: Uses the Haar cascade to detect faces, draws filled ellipses around them, and
+  blurs the mask to create a soft transition. Returned mask guides face-preserving blends in the
+  effects module.
+
+Image Processing Wrapper
+- `_process_image`: Routes the current image (or preview crop) to the selected ImageEffects routine,
+  converting slider values with the `safe_*` helpers and ensuring odd kernel sizes. It handles
+  preview-specific parameter adjustments (lighter sigma for watercolor previews) and provides robust
+  exception logging.
+
+Threaded Processing Pipeline
+- `cartoonify_threaded`: Validates that an image is loaded, updates button states and status text,
+  and spawns `_cartoonify_worker` on a daemon thread.
+- `_cartoonify_worker`: Saves the previous result for undo support, notifies the status bar of
+  progress milestones, runs `_process_image` on the full-resolution image, and forwards success or
+  failure back to the main thread.
+- `_on_processing_done`: Re-enables action buttons, updates the “after” preview, drives the status
+  bar to 100%, and reverts to idle after a short delay.
+- `_on_processing_failed`: Restores the UI and surfaces the exception message through the status bar
+  and a dialog.
+
+Saving, Exporting, Undoing
+- `save`: Prompts the user for a path and writes the processed image in the chosen format (PNG or
+  JPEG).
+- `export_comparison`: Builds a side-by-side before/after composite using Pillow and saves it via a
+  file dialog.
+- `undo`: Restores the last processed image stored by `_cartoonify_worker`, updates the preview, and
+  clears the undo slot.
+- `reset_to_defaults`: Iterates over all slider widgets, resetting them to the defaults dictionary;
+  also resets the style and face emphasis toggles and refreshes the visible parameter set.
+
+Webcam Integration
+- `start_webcam`: Opens a themed toplevel window for live capture, wires buttons for saving frames
+  and closing, and launches `_webcam_loop` on a background thread.
+- `_webcam_loop`: Continuously grabs frames from the webcam, processes them through `_process_image`
+  (with preview-friendly settings), pushes updates to the Tk label, and maintains a reference to the
+  latest processed frame for capturing. Handles shutdown carefully to avoid crashes if the window is
+  closed mid-loop.
+- `_capture_webcam_frame`: Saves the most recent processed frame to disk using a file dialog,
+  updates the webcam status label, and informs the user of the saved path.
+
+Application Entry Point
+- `main()`: Instantiates a Tk root (DnD-enabled when available), constructs `CartoonifyStudio`, and
+  enters the Tkinter mainloop. The `if __name__ == "__main__":` guard allows the GUI to run when the
+  module is executed directly.
+
+Summary
+-------
+`Image_Effects.py` encapsulates reusable, parameterized image stylization routines with robust
+fallbacks, while `gui_app.py` delivers a responsive, animated Tkinter interface that orchestrates
+file handling, threading, progress feedback, live previews, and webcam capture. Together they form
+Cartoonify Studio: a themed desktop application that transforms photos into cartoon, sketch,
+watercolor, or comic styles with extensive user control.
